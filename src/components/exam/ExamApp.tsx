@@ -39,6 +39,15 @@ function readSession(): Session | null {
   }
 }
 
+/** A saved session is only reused if it still matches the current questions. */
+function isSessionValid(s: Session, qs: PublicQuestion[]): boolean {
+  if (!s || typeof s.studentId !== 'string' || typeof s.startedAt !== 'number') return false;
+  if (typeof s.current !== 'number' || s.current < 0 || s.current >= qs.length) return false;
+  if (!s.answers || typeof s.answers !== 'object') return false;
+  const ids = new Set(qs.map((q) => String(q.id)));
+  return Object.keys(s.answers).every((k) => ids.has(k));
+}
+
 function writeSession(s: Session | null) {
   try {
     if (s) localStorage.setItem(STORAGE_KEY, JSON.stringify(s));
@@ -61,6 +70,7 @@ export default function ExamApp() {
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [online, setOnline] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const submittingRef = useRef(false);
   const autoSubmitRef = useRef(false);
@@ -111,10 +121,12 @@ export default function ExamApp() {
       }
 
       setQuestions(qs);
-      if (saved) {
+      if (saved && isSessionValid(saved, qs)) {
         setSession(saved);
         setPhase('exam');
       } else {
+        // Old data from a different question set (or corrupted): start fresh instead of crashing.
+        if (saved) writeSession(null);
         setPhase('intro');
       }
     })();
@@ -150,7 +162,16 @@ export default function ExamApp() {
       writeSession(done);
       setSession(done);
       setPhase('done');
-    } catch {
+    } catch (e) {
+      if (e instanceof Error && e.message.includes('student_not_found')) {
+        // The saved attempt no longer exists in the database: go back to the start screen.
+        pendingRef.current = false;
+        writeSession(null);
+        setSession(null);
+        setNotice('Bu sınaq sessiyası artıq mövcud deyil. Zəhmət olmasa sınağa yenidən başlayın.');
+        setPhase('intro');
+        return;
+      }
       pendingRef.current = true;
       setSubmitError(
         navigator.onLine
@@ -331,7 +352,7 @@ export default function ExamApp() {
   if (phase === 'intro') {
     return (
       <Shell>
-        <IntroForm total={questions.length} onStart={handleStart} />
+        <IntroForm total={questions.length} notice={notice} onStart={handleStart} />
       </Shell>
     );
   }
@@ -353,6 +374,7 @@ export default function ExamApp() {
   /* ---------- exam screen ---------- */
   const total = questions.length;
   const q = questions[session.current];
+  if (!q) return null;
   const selected = session.answers[q.id];
   const answeredCount = questions.filter((x) => session.answers[x.id]).length;
   const isLast = session.current === total - 1;
@@ -628,9 +650,11 @@ function Legend({ color, label }: { color: string; label: string }) {
 
 function IntroForm({
   total,
+  notice,
   onStart,
 }: {
   total: number;
+  notice?: string | null;
   onStart: (v: { fullName: string; className: string; school: string }) => Promise<string | null>;
 }) {
   const [fullName, setFullName] = useState('');
@@ -668,6 +692,12 @@ function IntroForm({
         <p className="mt-2 text-base text-slate-600">
           {total} sual, {EXAM_MINUTES} dəqiqə. Başladıqdan sonra taymer dayanmır — səhifəni yeniləsəniz də davam edir.
         </p>
+
+        {notice && (
+          <p role="status" className="mt-4 rounded-xl bg-amber-100 px-4 py-3 text-base font-semibold text-amber-900">
+            {notice}
+          </p>
+        )}
 
         <form onSubmit={submit} className="mt-6 space-y-5" noValidate>
           <div>
