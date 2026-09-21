@@ -40,15 +40,33 @@ function scoreBadge(score: number | null) {
   return 'bg-red-100 text-red-800';
 }
 
+export interface ExamOption {
+  id: number;
+  slug: string;
+  title: string;
+}
+type ResultRow = StudentResult & { exam_id: number };
+type StatRow = QuestionStat & { exam_id: number };
+
 export default function Dashboard({
-  results,
-  stats,
+  results: allResults,
+  stats: allStats,
+  exams,
+  defaultExamId,
   showExplanations,
 }: {
-  results: StudentResult[];
-  stats: QuestionStat[];
+  results: ResultRow[];
+  stats: StatRow[];
+  exams: ExamOption[];
+  defaultExamId: number | null;
   showExplanations: boolean;
 }) {
+  const [examId, setExamId] = useState<number | null>(defaultExamId);
+  const currentExam = exams.find((e) => e.id === examId) ?? null;
+  // Everything below (numbers, charts, table, exports) only sees the selected exam.
+  const results = useMemo(() => allResults.filter((r) => r.exam_id === examId), [allResults, examId]);
+  const stats = useMemo(() => allStats.filter((s) => s.exam_id === examId), [allStats, examId]);
+
   const [query, setQuery] = useState('');
   const [cls, setCls] = useState('');
   const [sort, setSort] = useState<SortKey>('date_desc');
@@ -172,7 +190,10 @@ export default function Dashboard({
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Nəticələr');
     XLSX.utils.book_append_sheet(wb, ws2, 'Suallar');
-    XLSX.writeFile(wb, `sinaq-neticeleri-${new Date().toISOString().slice(0, 10)}.xlsx`);
+    XLSX.writeFile(
+      wb,
+      `sinaq-neticeleri-${currentExam?.slug ?? 'sinaq'}-${new Date().toISOString().slice(0, 10)}.xlsx`,
+    );
   }
 
   function exportPdf() {
@@ -209,12 +230,19 @@ export default function Dashboard({
     <div className="space-y-6">
       {/* Print-only heading */}
       <div className="hidden print:block">
-        <h1 className="text-2xl font-extrabold">Rəqəm Sistemləri Onlayn Sınaq — Nəticələr</h1>
+        <h1 className="text-2xl font-extrabold">
+          {currentExam ? `${currentExam.title} — Nəticələr` : 'Rəqəm Sistemləri Onlayn Sınaq — Nəticələr'}
+        </h1>
         <p className="text-sm text-slate-600">Müəllimə Elmira Fətəliyeva · {formatDate(new Date().toISOString())}</p>
       </div>
 
       <div className="flex flex-wrap items-center justify-between gap-3 print:hidden">
-        <h1 className="text-3xl font-extrabold tracking-tight text-slate-900">Nəticələr</h1>
+        <div>
+          <h1 className="text-3xl font-extrabold tracking-tight text-slate-900">Nəticələr</h1>
+          {currentExam && exams.length === 1 && (
+            <p className="mt-1 text-sm text-slate-600">{currentExam.title}</p>
+          )}
+        </div>
 
         <div className="flex flex-wrap items-center gap-2">
           <button type="button" onClick={exportExcel} className={btn}>
@@ -228,6 +256,40 @@ export default function Dashboard({
           </button>
         </div>
       </div>
+
+      {exams.length > 1 && (
+        <div className="rounded-2xl border border-blue-100 bg-white p-4 print:hidden">
+          <label htmlFor="exam" className="text-sm font-bold text-slate-700">
+            Sınaq
+          </label>
+          <select
+            id="exam"
+            value={examId ?? ''}
+            onChange={(e) => {
+              setExamId(Number(e.target.value));
+              setQuery('');
+              setCls('');
+              setLimit(PAGE_SIZE);
+            }}
+            className={`${control} mt-1 block w-full`}
+          >
+            {exams.map((ex) => (
+              <option key={ex.id} value={ex.id}>
+                {ex.title}
+              </option>
+            ))}
+          </select>
+          <p className="mt-2 text-sm text-slate-600">
+            Nəticələr, qrafiklər və Excel yalnız seçilmiş sınağa aiddir.
+          </p>
+        </div>
+      )}
+
+      {exams.length === 0 && (
+        <p className="rounded-2xl bg-amber-50 px-5 py-4 font-semibold text-amber-900">
+          Hələ heç bir sınaq yaradılmayıb.
+        </p>
+      )}
 
       {pdfHint && (
         <p className="rounded-xl bg-blue-50 px-4 py-3 text-sm text-blue-900 print:hidden">
