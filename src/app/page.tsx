@@ -1,11 +1,32 @@
 import Link from 'next/link';
+import { createClient } from '@supabase/supabase-js';
 import { EXAM_MINUTES } from '@/lib/types';
 
-const facts = [
-  { value: '25', label: 'sual' },
-  { value: `${EXAM_MINUTES}`, label: 'dəqiqə vaxt limiti' },
-  { value: 'A–E', label: 'çoxseçimli test' },
-];
+// Always read the current number of questions (no caching), so it changes as soon as the questions do.
+export const dynamic = 'force-dynamic';
+
+interface ExamSummary {
+  question_count: number;
+  duration_minutes: number;
+}
+
+async function getExamSummaries(): Promise<ExamSummary[] | null> {
+  try {
+    const supabase = createClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+      { auth: { persistSession: false, autoRefreshToken: false } },
+    );
+    const result = await Promise.race([
+      supabase.rpc('get_exams'),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
+    ]);
+    if (!result || result.error || !result.data) return null;
+    return result.data as ExamSummary[];
+  } catch {
+    return null; // never break the home page because of this
+  }
+}
 
 const conversions = [
   { base: 'Onluq', value: '25', sub: '10' },
@@ -14,7 +35,20 @@ const conversions = [
   { base: 'Onaltılıq', value: '19', sub: '16' },
 ];
 
-export default function HomePage() {
+export default async function HomePage() {
+  const exams = await getExamSummaries();
+  // One exam: show its size. Several exams: students pick one on the next screen.
+  const facts: { value: string; label: string }[] = [];
+  if (exams && exams.length === 1) {
+    facts.push({ value: String(exams[0].question_count), label: 'sual' });
+    facts.push({ value: String(exams[0].duration_minutes), label: 'dəqiqə vaxt limiti' });
+  } else if (exams && exams.length > 1) {
+    facts.push({ value: String(exams.length), label: 'sınaq mövcuddur' });
+  } else {
+    facts.push({ value: `${EXAM_MINUTES}`, label: 'dəqiqə vaxt limiti' });
+  }
+  facts.push({ value: 'A–E', label: 'çoxseçimli test' });
+
   return (
     <main className="min-h-dvh bg-gradient-to-br from-blue-50 via-white to-emerald-50">
       <div className="mx-auto flex min-h-dvh max-w-6xl flex-col px-5 py-6 sm:px-8">
