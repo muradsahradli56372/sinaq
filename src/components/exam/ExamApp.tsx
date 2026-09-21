@@ -4,7 +4,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { createClient } from '@/lib/supabase/client';
 import {
-  EXAM_MINUTES,
   EXAM_SECONDS,
   OPTION_KEYS,
   formatClock,
@@ -15,11 +14,25 @@ import {
 import ExplanationsView from './ExplanationsView';
 
 const STORAGE_KEY = 'elmira-exam-v1';
-const QUESTIONS_KEY = 'elmira-exam-questions-v1';
+const EXAMS_KEY = 'elmira-exams-v2';
+const questionsKey = (examId: number) => `elmira-exam-questions-v2-${examId}`;
 
-type Phase = 'loading' | 'intro' | 'exam' | 'done' | 'error';
+type Phase = 'loading' | 'choose' | 'intro' | 'exam' | 'done' | 'error';
+
+interface ExamInfo {
+  id: number;
+  slug: string;
+  title: string;
+  description: string | null;
+  duration_minutes: number;
+  question_count: number;
+}
+
+type Client = ReturnType<typeof createClient>;
 
 interface Session {
+  /** Which exam this attempt belongs to (missing in attempts saved by the older version). */
+  examId?: number;
   studentId: string;
   fullName: string;
   className: string;
@@ -57,10 +70,65 @@ function writeSession(s: Session | null) {
   }
 }
 
+/** Active exams. Falls back to the copy saved on this device when offline. */
+async function fetchExams(supabase: Client): Promise<ExamInfo[] | null> {
+  try {
+    const { data, error } = await supabase.rpc('get_exams');
+    if (!error && data) {
+      const list = data as ExamInfo[];
+      try {
+        localStorage.setItem(EXAMS_KEY, JSON.stringify(list));
+      } catch {
+        /* ignore */
+      }
+      return list;
+    }
+  } catch {
+    /* offline – use the saved copy below */
+  }
+  try {
+    const raw = localStorage.getItem(EXAMS_KEY);
+    if (raw) return JSON.parse(raw) as ExamInfo[];
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+/** Questions of one exam. Falls back to the copy saved on this device when offline. */
+async function fetchQuestions(supabase: Client, examId: number): Promise<PublicQuestion[] | null> {
+  try {
+    const { data, error } = await supabase.rpc('get_exam_questions', { p_exam_id: examId });
+    if (!error && data) {
+      const list = data as PublicQuestion[];
+      if (list.length) {
+        try {
+          localStorage.setItem(questionsKey(examId), JSON.stringify(list));
+        } catch {
+          /* ignore */
+        }
+      }
+      return list;
+    }
+  } catch {
+    /* offline – use the saved copy below */
+  }
+  try {
+    const raw = localStorage.getItem(questionsKey(examId));
+    if (raw) return JSON.parse(raw) as PublicQuestion[];
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
 export default function ExamApp() {
   const supabase = useMemo(() => createClient(), []);
 
   const [phase, setPhase] = useState<Phase>('loading');
+  const [exams, setExams] = useState<ExamInfo[]>([]);
+  const [exam, setExam] = useState<ExamInfo | null>(null);
+  const [openingId, setOpeningId] = useState<number | null>(null);
   const [questions, setQuestions] = useState<PublicQuestion[]>([]);
   const [session, setSession] = useState<Session | null>(null);
   const [remaining, setRemaining] = useState(EXAM_SECONDS);
@@ -72,11 +140,32 @@ export default function ExamApp() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
+  const examSeconds = (exam?.duration_minutes ?? EXAM_SECONDS / 60) * 60;
+
   const submittingRef = useRef(false);
   const autoSubmitRef = useRef(false);
   const pendingRef = useRef(false);
 
-  /* ---------- initial load: saved session + questions ---------- */
+  /* ---------- open an exam: load its questions and show the name form ---------- */
+  const openExam = useCallback(
+    async (ex: ExamInfo) => {
+      setLoadError(null);
+      setOpeningId(ex.id);
+      const qs = await fetchQuestions(supabase, ex.id);
+      setOpeningId(null);
+      if (!qs || qs.length === 0) {
+        setLoadError('Suallar yüklənmədi. İnternet bağlantısını yoxlayıb səhifəni yeniləyin.');
+        setPhase('error');
+        return;
+      }
+      setExam(ex);
+      setQuestions(qs);
+      setPhase('intro');
+    },
+    [supabase],
+  );
+
+  /* ---------- initial load: exams + saved attempt ---------- */
   useEffect(() => {
     let cancelled = false;
     const saved = readSession();
@@ -88,53 +177,52 @@ export default function ExamApp() {
     }
 
     (async () => {
-      let qs: PublicQuestion[] | null = null;
-      try {
-        const { data, error } = await supabase.rpc('get_exam_questions');
-        if (!error && data && data.length) {
-          qs = data as PublicQuestion[];
-          try {
-            localStorage.setItem(QUESTIONS_KEY, JSON.stringify(qs));
-          } catch {
-            /* ignore */
-          }
-        }
-      } catch {
-        /* offline – fall back to the cached copy below */
-      }
-
-      if (!qs) {
-        try {
-          const raw = localStorage.getItem(QUESTIONS_KEY);
-          if (raw) qs = JSON.parse(raw) as PublicQuestion[];
-        } catch {
-          /* ignore */
-        }
-      }
-
+      const list = await fetchExams(supabase);
       if (cancelled) return;
 
-      if (!qs || qs.length === 0) {
-        setLoadError('Suallar yüklənmədi. İnternet bağlantısını yoxlayıb səhifəni yeniləyin.');
+      if (!list) {
+        setLoadError('Sınaqlar yüklənmədi. İnternet bağlantısını yoxlayıb səhifəni yeniləyin.');
         setPhase('error');
         return;
       }
-
-      setQuestions(qs);
-      if (saved && isSessionValid(saved, qs)) {
-        setSession(saved);
-        setPhase('exam');
-      } else {
-        // Old data from a different question set (or corrupted): start fresh instead of crashing.
-        if (saved) writeSession(null);
-        setPhase('intro');
+      if (list.length === 0) {
+        setLoadError('Hazırda aktiv sınaq yoxdur.');
+        setPhase('error');
+        return;
       }
+      setExams(list);
+
+      // continue an unfinished attempt (also after a refresh)
+      if (saved) {
+        const ex = list.find((e) => e.id === (saved.examId ?? list[0].id));
+        if (ex) {
+          const qs = await fetchQuestions(supabase, ex.id);
+          if (cancelled) return;
+          if (!qs) {
+            setLoadError('Suallar yüklənmədi. İnternet bağlantısını yoxlayıb səhifəni yeniləyin.');
+            setPhase('error');
+            return;
+          }
+          if (qs.length && isSessionValid(saved, qs)) {
+            setExam(ex);
+            setQuestions(qs);
+            setSession({ ...saved, examId: ex.id });
+            setPhase('exam');
+            return;
+          }
+        }
+        // Old data from a different question set / removed exam: start fresh instead of crashing.
+        writeSession(null);
+      }
+
+      if (list.length === 1) await openExam(list[0]);
+      else setPhase('choose');
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [supabase]);
+  }, [supabase, openExam]);
 
   /* ---------- autosave answers + position ---------- */
   useEffect(() => {
@@ -210,11 +298,11 @@ export default function ExamApp() {
   useEffect(() => {
     if (phase !== 'exam' || startedAt === undefined) return;
     const tick = () =>
-      setRemaining(Math.max(0, EXAM_SECONDS - Math.floor((Date.now() - startedAt) / 1000)));
+      setRemaining(Math.max(0, examSeconds - Math.floor((Date.now() - startedAt) / 1000)));
     tick();
     const id = setInterval(tick, 1000);
     return () => clearInterval(id);
-  }, [phase, startedAt]);
+  }, [phase, startedAt, examSeconds]);
 
   /* ---------- auto-submit when time is up ---------- */
   useEffect(() => {
@@ -280,17 +368,20 @@ export default function ExamApp() {
     className: string;
     school: string;
   }): Promise<string | null> {
+    if (!exam) return 'Sınaq seçilməyib. Səhifəni yeniləyin.';
     try {
       const { data, error } = await supabase.rpc('start_exam', {
         p_full_name: v.fullName,
         p_class: v.className,
         p_school: v.school || null,
+        p_exam_id: exam.id,
       });
       if (error || !data || data.length === 0) {
         return 'Sınaq başlaya bilmədi. İnternet bağlantısını yoxlayıb yenidən cəhd edin.';
       }
       const row = data[0] as { student_id: string };
       const s: Session = {
+        examId: exam.id,
         studentId: row.student_id,
         fullName: v.fullName,
         className: v.className,
@@ -302,7 +393,7 @@ export default function ExamApp() {
       writeSession(s);
       autoSubmitRef.current = false;
       pendingRef.current = false;
-      setRemaining(EXAM_SECONDS);
+      setRemaining(examSeconds);
       setSession(s);
       setPhase('exam');
       window.scrollTo({ top: 0 });
@@ -314,10 +405,7 @@ export default function ExamApp() {
 
   function resetForNewStudent() {
     writeSession(null);
-    setSession(null);
-    setSubmitError(null);
-    setPhase(questions.length ? 'intro' : 'loading');
-    if (!questions.length) window.location.reload();
+    window.location.reload();
   }
 
   /* =============================== render =============================== */
@@ -349,10 +437,34 @@ export default function ExamApp() {
     );
   }
 
+  if (phase === 'choose') {
+    return (
+      <Shell>
+        <ChooseExam exams={exams} openingId={openingId} onChoose={(ex) => void openExam(ex)} />
+      </Shell>
+    );
+  }
+
   if (phase === 'intro') {
     return (
       <Shell>
-        <IntroForm total={questions.length} notice={notice} onStart={handleStart} />
+        <IntroForm
+          examTitle={exam?.title}
+          total={questions.length}
+          minutes={exam?.duration_minutes ?? EXAM_SECONDS / 60}
+          notice={notice}
+          onBack={
+            exams.length > 1
+              ? () => {
+                  setExam(null);
+                  setQuestions([]);
+                  setNotice(null);
+                  setPhase('choose');
+                }
+              : undefined
+          }
+          onStart={handleStart}
+        />
       </Shell>
     );
   }
@@ -648,13 +760,68 @@ function Legend({ color, label }: { color: string; label: string }) {
   );
 }
 
+function ChooseExam({
+  exams,
+  openingId,
+  onChoose,
+}: {
+  exams: ExamInfo[];
+  openingId: number | null;
+  onChoose: (ex: ExamInfo) => void;
+}) {
+  return (
+    <div className="mx-auto max-w-2xl pt-4">
+      <Link href="/" className="inline-block rounded-lg px-2 py-1 text-sm font-medium text-slate-600 hover:text-blue-700">
+        ← Ana səhifə
+      </Link>
+
+      <Card className="mt-3">
+        <h1 className="text-3xl font-extrabold tracking-tight text-slate-900">Sınağı seçin</h1>
+        <p className="mt-2 text-base text-slate-600">Həll etmək istədiyiniz sual toplusunu seçin.</p>
+
+        <ul className="mt-6 space-y-3">
+          {exams.map((ex) => (
+            <li key={ex.id}>
+              <button
+                type="button"
+                onClick={() => onChoose(ex)}
+                disabled={openingId !== null}
+                className="flex min-h-20 w-full items-center justify-between gap-4 rounded-2xl border-2 border-slate-200 bg-white p-4 text-left transition-colors hover:border-blue-400 hover:bg-blue-50/50 disabled:opacity-60"
+              >
+                <span className="min-w-0">
+                  <span className="block text-lg font-extrabold leading-snug text-slate-900">{ex.title}</span>
+                  {ex.description && (
+                    <span className="mt-0.5 block text-sm text-slate-600">{ex.description}</span>
+                  )}
+                  <span className="mt-1 block text-sm font-semibold text-blue-700">
+                    {ex.question_count} sual · {ex.duration_minutes} dəqiqə
+                  </span>
+                </span>
+                <span aria-hidden="true" className="shrink-0 text-2xl font-bold text-blue-600">
+                  {openingId === ex.id ? '…' : '→'}
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      </Card>
+    </div>
+  );
+}
+
 function IntroForm({
+  examTitle,
   total,
+  minutes,
   notice,
+  onBack,
   onStart,
 }: {
+  examTitle?: string;
   total: number;
+  minutes: number;
   notice?: string | null;
+  onBack?: () => void;
   onStart: (v: { fullName: string; className: string; school: string }) => Promise<string | null>;
 }) {
   const [fullName, setFullName] = useState('');
@@ -683,14 +850,25 @@ function IntroForm({
 
   return (
     <div className="mx-auto max-w-xl pt-4">
-      <Link href="/" className="inline-block rounded-lg px-2 py-1 text-sm font-medium text-slate-600 hover:text-blue-700">
-        ← Ana səhifə
-      </Link>
+      {onBack ? (
+        <button
+          type="button"
+          onClick={onBack}
+          className="inline-block rounded-lg px-2 py-1 text-sm font-medium text-slate-600 hover:text-blue-700"
+        >
+          ← Sınaq seçiminə qayıt
+        </button>
+      ) : (
+        <Link href="/" className="inline-block rounded-lg px-2 py-1 text-sm font-medium text-slate-600 hover:text-blue-700">
+          ← Ana səhifə
+        </Link>
+      )}
 
       <Card className="mt-3">
-        <h1 className="text-3xl font-extrabold tracking-tight text-slate-900">Sınağa başlamazdan əvvəl</h1>
+        {examTitle && <p className="text-sm font-bold text-blue-700">{examTitle}</p>}
+        <h1 className="mt-1 text-3xl font-extrabold tracking-tight text-slate-900">Sınağa başlamazdan əvvəl</h1>
         <p className="mt-2 text-base text-slate-600">
-          {total} sual, {EXAM_MINUTES} dəqiqə. Başladıqdan sonra taymer dayanmır — səhifəni yeniləsəniz də davam edir.
+          {total} sual, {minutes} dəqiqə. Başladıqdan sonra taymer dayanmır — səhifəni yeniləsəniz də davam edir.
         </p>
 
         {notice && (
