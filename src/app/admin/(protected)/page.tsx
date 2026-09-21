@@ -1,7 +1,10 @@
 import type { Metadata } from 'next';
 import { createClient } from '@/lib/supabase/server';
 import type { QuestionStat, StudentResult } from '@/lib/types';
-import Dashboard from '@/components/admin/Dashboard';
+import Dashboard, { type ExamOption } from '@/components/admin/Dashboard';
+
+type ResultRow = StudentResult & { exam_id: number };
+type StatRow = QuestionStat & { exam_id: number };
 
 export const metadata: Metadata = { title: 'Nəticələr – Müəllim paneli' };
 export const dynamic = 'force-dynamic';
@@ -11,7 +14,7 @@ const PAGE = 1000; // Supabase returns at most 1000 rows per request
 export default async function AdminPage() {
   const supabase = await createClient();
 
-  const results: StudentResult[] = [];
+  const results: ResultRow[] = [];
   for (let from = 0; ; from += PAGE) {
     const { data, error } = await supabase
       .from('student_results')
@@ -19,7 +22,7 @@ export default async function AdminPage() {
       .order('started_at', { ascending: false })
       .range(from, from + PAGE - 1);
     if (error) throw new Error(error.message);
-    results.push(...((data ?? []) as StudentResult[]));
+    results.push(...((data ?? []) as ResultRow[]));
     if (!data || data.length < PAGE) break;
   }
 
@@ -28,6 +31,17 @@ export default async function AdminPage() {
     .select('*')
     .order('position');
   if (statsError) throw new Error(statsError.message);
+
+  const { data: examRows, error: examError } = await supabase
+    .from('exams')
+    .select('id, slug, title')
+    .order('sort_order')
+    .order('id');
+  if (examError) throw new Error(examError.message);
+  const exams = (examRows ?? []) as ExamOption[];
+
+  // Open on the exam that had the latest activity (results are newest first).
+  const defaultExamId = results[0]?.exam_id ?? exams[0]?.id ?? null;
 
   const { data: setting } = await supabase
     .from('settings')
@@ -38,7 +52,9 @@ export default async function AdminPage() {
   return (
     <Dashboard
       results={results}
-      stats={(stats ?? []) as QuestionStat[]}
+      stats={(stats ?? []) as StatRow[]}
+      exams={exams}
+      defaultExamId={defaultExamId}
       showExplanations={setting?.value === true}
     />
   );
